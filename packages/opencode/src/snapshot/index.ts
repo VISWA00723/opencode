@@ -129,34 +129,37 @@ export namespace Snapshot {
 
   export async function revert(patches: Patch[]) {
     const files = new Set<string>()
+    const kept: string[] = []
     const git = gitdir()
     for (const item of patches) {
       for (const file of item.files) {
         if (files.has(file)) continue
+        files.add(file)
         log.info("reverting", { file, hash: item.hash })
         const result = await $`git --git-dir ${git} --work-tree ${Instance.worktree} checkout ${item.hash} -- ${file}`
           .quiet()
           .cwd(Instance.worktree)
           .nothrow()
-        if (result.exitCode !== 0) {
-          const relativePath = path.relative(Instance.worktree, file)
-          const checkTree =
-            await $`git --git-dir ${git} --work-tree ${Instance.worktree} ls-tree ${item.hash} -- ${relativePath}`
-              .quiet()
-              .cwd(Instance.worktree)
-              .nothrow()
-          if (checkTree.exitCode === 0 && checkTree.text().trim()) {
-            log.info("file existed in snapshot but checkout failed, keeping", {
-              file,
-            })
-          } else {
-            log.info("file did not exist in snapshot, deleting", { file })
-            await fs.unlink(file).catch(() => {})
-          }
+        if (result.exitCode === 0) continue
+        const rel = path.relative(Instance.worktree, file).replaceAll("\\", "/")
+        const tree = await $`git --git-dir ${git} --work-tree ${Instance.worktree} ls-tree ${item.hash} -- ${rel}`
+          .quiet()
+          .cwd(Instance.worktree)
+          .nothrow()
+        if (tree.exitCode !== 0 || tree.text().trim()) {
+          log.warn("earlier content is not in the snapshot store, keeping", {
+            file,
+            hash: item.hash,
+            stderr: (tree.exitCode === 0 ? result.stderr : tree.stderr).toString(),
+          })
+          kept.push(file)
+          continue
         }
-        files.add(file)
+        log.info("file did not exist in snapshot, deleting", { file, hash: item.hash })
+        await fs.unlink(file).catch(() => {})
       }
     }
+    return kept
   }
 
   export async function diff(hash: string) {

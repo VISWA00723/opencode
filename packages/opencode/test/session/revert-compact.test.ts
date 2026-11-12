@@ -1,9 +1,14 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test"
+import { $ } from "bun"
 import path from "path"
 import { Session } from "../../src/session"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionCompaction } from "../../src/session/compaction"
 import { MessageV2 } from "../../src/session/message-v2"
+import { Snapshot } from "../../src/snapshot"
+import { Server } from "../../src/server/server"
+import { Bus } from "../../src/bus"
+import { Global } from "../../src/global"
 import { Log } from "../../src/util/log"
 import { Instance } from "../../src/project/instance"
 import { Identifier } from "../../src/id/id"
@@ -279,6 +284,123 @@ describe("revert + compact workflow", () => {
 
         // Clean up
         await Session.remove(sessionID)
+      },
+    })
+  })
+
+  test("should keep files and emit session.error when snapshot was pruned before revert", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const errors: string[] = []
+        const unsub = Bus.subscribe(Session.Event.Error, (event) => {
+          const err = event.properties.error
+          if (err?.name === "UnknownError") errors.push(err.data.message)
+        })
+
+        const notes = path.join(tmp.path, "notes.txt")
+        await Bun.write(notes, "original")
+
+        const session = await Session.create({})
+        const id = session.id
+
+        const user = await Session.updateMessage({
+          id: Identifier.ascending("message"),
+          role: "user",
+          sessionID: id,
+          agent: "default",
+          model: {
+            providerID: "openai",
+            modelID: "gpt-4",
+          },
+          time: {
+            created: Date.now(),
+          },
+        })
+
+        await Session.updatePart({
+          id: Identifier.ascending("part"),
+          messageID: user.id,
+          sessionID: id,
+          type: "text",
+          text: "Edit notes.txt",
+        })
+
+        const before = await Snapshot.track()
+        expect(before).toBeTruthy()
+        await Bun.write(notes, "agent edit")
+        const patch = await Snapshot.patch(before!)
+
+        const assistant: MessageV2.Assistant = {
+          id: Identifier.ascending("message"),
+          role: "assistant",
+          sessionID: id,
+          mode: "default",
+          agent: "default",
+          path: {
+            cwd: tmp.path,
+            root: tmp.path,
+          },
+          cost: 0,
+          tokens: {
+            output: 0,
+            input: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          },
+          modelID: "gpt-4",
+          providerID: "openai",
+          parentID: user.id,
+          time: {
+            created: Date.now(),
+          },
+          finish: "end_turn",
+        }
+        await Session.updateMessage(assistant)
+
+        await Session.updatePart({
+          id: Identifier.ascending("part"),
+          messageID: assistant.id,
+          sessionID: id,
+          type: "patch",
+          hash: patch.hash,
+          files: patch.files,
+        })
+
+        // Advance snapshot index and prune unreferenced trees like `Snapshot.cleanup()`
+        await Snapshot.track()
+        const git = path.join(Global.Path.data, "snapshot", Instance.project.id)
+        await $`git --git-dir ${git} reflog expire --expire=now --all`.quiet().nothrow()
+        await $`git --git-dir ${git} gc --quiet --prune=now`.quiet()
+
+        // Confirm snapshot tree was genuinely pruned (ls-tree exits non-zero, which previously triggered deletion)
+        const tree = await $`git --git-dir ${git} --work-tree ${tmp.path} ls-tree ${before!} -- notes.txt`
+          .quiet()
+          .nothrow()
+        expect(tree.exitCode).not.toBe(0)
+
+        // User edits notes.txt manually after agent turn
+        await Bun.write(notes, "manual edit")
+
+        // Exercise the full HTTP POST /session/:sessionID/revert endpoint
+        const res = await Server.App().request(`/session/${id}/revert?directory=${encodeURIComponent(tmp.path)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messageID: user.id }),
+        })
+        expect(res.status).toBe(200)
+
+        unsub()
+
+        expect(await Bun.file(notes).exists()).toBe(true)
+        expect(await Bun.file(notes).text()).toBe("manual edit")
+        expect((await Session.get(id)).revert?.messageID).toBe(user.id)
+        expect(errors).toEqual([
+          "Revert kept 1 file as is because the snapshot store no longer has the earlier version: notes.txt",
+        ])
+
+        await Session.remove(id)
       },
     })
   })

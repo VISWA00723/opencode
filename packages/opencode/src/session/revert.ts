@@ -1,4 +1,5 @@
 import z from "zod"
+import path from "path"
 import { Identifier } from "../id/id"
 import { Snapshot } from "../snapshot"
 import { MessageV2 } from "./message-v2"
@@ -8,6 +9,8 @@ import { splitWhen } from "remeda"
 import { Storage } from "../storage/storage"
 import { Bus } from "../bus"
 import { SessionPrompt } from "./prompt"
+import { Instance } from "../project/instance"
+import { NamedError } from "@opencode-ai/util/error"
 
 export namespace SessionRevert {
   const log = Log.create({ service: "session.revert" })
@@ -55,7 +58,17 @@ export namespace SessionRevert {
     if (revert) {
       const session = await Session.get(input.sessionID)
       revert.snapshot = session.revert?.snapshot ?? (await Snapshot.track())
-      await Snapshot.revert(patches)
+      const kept = await Snapshot.revert(patches)
+      if (kept.length > 0) {
+        const names = kept.map((file) => path.relative(Instance.worktree, file).replaceAll("\\", "/"))
+        const listed = names.slice(0, 5).join(", ") + (names.length > 5 ? ` and ${names.length - 5} more` : "")
+        const count = names.length === 1 ? "1 file" : `${names.length} files`
+        const message = `Revert kept ${count} as is because the snapshot store no longer has the earlier version: ${listed}`
+        await Bus.publish(Session.Event.Error, {
+          sessionID: input.sessionID,
+          error: new NamedError.Unknown({ message }).toObject(),
+        })
+      }
       if (revert.snapshot) revert.diff = await Snapshot.diff(revert.snapshot)
       return Session.update(input.sessionID, (draft) => {
         draft.revert = revert
