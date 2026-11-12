@@ -1,7 +1,10 @@
 import { test, expect } from "bun:test"
 import { $ } from "bun"
+import path from "path"
+import fs from "fs/promises"
 import { Snapshot } from "../../src/snapshot"
 import { Instance } from "../../src/project/instance"
+import { Global } from "../../src/global"
 import { tmpdir } from "../fixture/fixture"
 
 async function bootstrap() {
@@ -208,10 +211,10 @@ test("revert with empty patches", async () => {
     directory: tmp.path,
     fn: async () => {
       // Should not crash with empty patches
-      expect(Snapshot.revert([])).resolves.toBeUndefined()
+      expect(Snapshot.revert([])).resolves.toEqual([])
 
       // Should not crash with patches that have empty file lists
-      expect(Snapshot.revert([{ hash: "dummy", files: [] }])).resolves.toBeUndefined()
+      expect(Snapshot.revert([{ hash: "dummy", files: [] }])).resolves.toEqual([])
     },
   })
 })
@@ -252,7 +255,58 @@ test("revert non-existent file", async () => {
             files: [`${tmp.path}/nonexistent.txt`],
           },
         ]),
-      ).resolves.toBeUndefined()
+      ).resolves.toEqual([])
+    },
+  })
+})
+
+test("revert keeps files whose earlier content the snapshot store no longer has", async () => {
+  await using tmp = await bootstrap()
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      await Bun.write(path.join(tmp.path, "draft.txt"), "uncommitted")
+      const before = await Snapshot.track()
+      expect(before).toBeTruthy()
+
+      await Bun.write(path.join(tmp.path, "a.txt"), "agent edit")
+      await Bun.write(path.join(tmp.path, "new.txt"), "NEW")
+      const patch = await Snapshot.patch(before!)
+
+      // Advance snapshot index so `before` tree becomes unreferenced, then prune like `Snapshot.cleanup()`
+      await Snapshot.track()
+      const git = path.join(Global.Path.data, "snapshot", Instance.project.id)
+      await $`git --git-dir ${git} reflog expire --expire=now --all`.quiet().nothrow()
+      await $`git --git-dir ${git} gc --quiet --prune=now`.quiet()
+
+      await Bun.write(path.join(tmp.path, "a.txt"), "edited after the snapshot")
+
+      const kept = await Snapshot.revert([patch])
+
+      expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe("edited after the snapshot")
+      expect(await Bun.file(path.join(tmp.path, "new.txt")).text()).toBe("NEW")
+      expect(kept.toSorted()).toEqual([path.join(tmp.path, "a.txt"), path.join(tmp.path, "new.txt")].toSorted())
+    },
+  })
+})
+
+test("revert still deletes a file the readable snapshot records as absent, and reports nothing", async () => {
+  await using tmp = await bootstrap()
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const before = await Snapshot.track()
+      expect(before).toBeTruthy()
+
+      await fs.mkdir(path.join(tmp.path, "nested"), { recursive: true })
+      await Bun.write(path.join(tmp.path, "nested", "new.txt"), "NEW")
+      await Bun.write(path.join(tmp.path, "a.txt"), "edited")
+
+      const kept = await Snapshot.revert([await Snapshot.patch(before!)])
+
+      expect(kept).toEqual([])
+      expect(await Bun.file(path.join(tmp.path, "nested", "new.txt")).exists()).toBe(false)
+      expect(await Bun.file(path.join(tmp.path, "a.txt")).text()).toBe(tmp.extra.aContent)
     },
   })
 })
